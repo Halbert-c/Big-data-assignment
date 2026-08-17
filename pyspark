@@ -1,0 +1,127 @@
+import time
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import DoubleType
+from pyspark.ml.feature import VectorAssembler, StringIndexer
+from pyspark.ml.regression import RandomForestRegressor
+from pyspark.ml.evaluation import RegressionEvaluator
+
+# 1. Initialize the Spark Session
+spark = SparkSession.builder.appName("Scale_Join_RF_Benchmark").getOrCreate()
+
+# 2. Read the datasets from S3
+weather_csv_path = "s3://weather-data-assignment/all_datasets(1)/full_weather_places.csv"
+air_quality_csv_path = "s3://weather-data-assignment/all_datasets(1)/air_quality.csv"
+
+df_weather = spark.read.option("header", "true").csv(weather_csv_path)
+df_air = spark.read.option("header", "true").csv(air_quality_csv_path)
+
+# 3. Clean and cast types for scaling
+df_weather = df_weather \
+    .withColumn("datetime", F.to_timestamp(F.col("datetime"))) \
+    .withColumn("temperature", F.col("temperature").cast(DoubleType())) \
+    .withColumn("humidity", F.col("humidity").cast(DoubleType())) \
+    .withColumn("wind_speed", F.col("wind_speed").cast(DoubleType()))
+
+df_air = df_air \
+    .withColumn("datetime", F.to_timestamp(F.col("datetime"))) \
+    .withColumn("pollutant_value", F.col("pollutant_value").cast(DoubleType()))
+
+# --- START TIMER ---
+start_time = time.time()
+
+# 4. Scale the Datasets (100x)
+MULTIPLIER = 2
+df_multiplier = spark.range(0, MULTIPLIER).withColumnRenamed("id", "iteration")
+
+df_weather_large = df_weather.crossJoin(df_multiplier) \
+    .withColumn("datetime", F.expr("add_months(datetime, CAST(iteration AS INT))")) \
+    .withColumn("temperature", F.col("temperature") * (1 + F.randn() * 0.02)) \
+    .withColumn("humidity", F.col("humidity") * (1 + F.randn() * 0.02)) \
+    .withColumn("wind_speed", F.col("wind_speed") * (1 + F.randn() * 0.02)) \
+    .drop("iteration")
+
+df_air_large = df_air.crossJoin(df_multiplier) \
+    .withColumn("datetime", F.expr("add_months(datetime, CAST(iteration AS INT))")) \
+    .withColumn("pollutant_value", F.col("pollutant_value") * (1 + F.randn() * 0.02)) \
+    .drop("iteration")
+
+# 5. Perform the Massive Distributed Join
+
+df_joined = df_weather_large.alias("w").join(
+    df_air_large.alias("a"),
+    (F.col("w.datetime") == F.col("a.datetime")) & 
+    (F.col("w.place") == F.col("a.place")),
+    how="inner"
+).select(
+    F.col("w.datetime").alias("datetime"),
+    F.col("w.place").alias("place"),
+    F.col("w.temperature"),
+    F.col("w.humidity"),
+    F.col("w.wind_speed"),
+    F.col("a.pollutant"),
+    F.col("a.pollutant_value")
+).dropna(subset=["temperature", "humidity", "wind_speed", "pollutant", "pollutant_value"])
+
+# 6. Feature Engineering (String Indexing & Vectorization)
+print("Vectorizing features...")
+indexer = StringIndexer(inputCol="pollutant", outputCol="pollutant_idx", handleInvalid="skip")
+df_indexed = indexer.fit(df_joined).transform(df_joined)
+
+assembler = VectorAssembler(
+    inputCols=["temperature", "humidity", "wind_speed", "pollutant_idx"], 
+    outputCol="features"
+)
+df_vectorized = assembler.transform(df_indexed).select(
+    "datetime", 
+    "place", 
+    "pollutant",
+    "features", 
+    F.col("pollutant_value").alias("label")
+)
+
+# Cache the dataset to execute the scale and join before ML training begins
+df_vectorized.cache()
+final_row_count = df_vectorized.count()
+print(f"Total Rows for ML Training: {final_row_count:,}")
+
+# 7. Train-Test Split
+train_data, test_data = df_vectorized.randomSplit([0.8, 0.2], seed=42)
+
+# 8. Train the Random Forest Model
+print("Training the Random Forest model across the Spark cluster...")
+rf_algorithm = RandomForestRegressor(
+    featuresCol="features", 
+    labelCol="label", 
+    numTrees=20,  # Keeping at 20 for large-scale benchmarking
+    maxDepth=10
+)
+model = rf_algorithm.fit(train_data)
+
+# 9. Evaluate Algorithm Performance Across Metrics
+print("Evaluating model")
+predictions = model.transform(test_data)
+
+rmse_eval = RegressionEvaluator(labelCol="label", predictionCol="prediction", metricName="rmse")
+mse_eval = RegressionEvaluator(labelCol="label", predictionCol="prediction", metricName="mse")
+mae_eval = RegressionEvaluator(labelCol="label", predictionCol="prediction", metricName="mae")
+r2_eval = RegressionEvaluator(labelCol="label", predictionCol="prediction", metricName="r2")
+
+rmse = rmse_eval.evaluate(predictions)
+mse = mse_eval.evaluate(predictions)
+mae = mae_eval.evaluate(predictions)
+r2 = r2_eval.evaluate(predictions)
+
+# --- END TIMER ---
+end_time = time.time()
+elapsed_seconds = end_time - start_time
+
+print(f"\n Metrics")
+print(f"Root Mean Squared Error (RMSE): {rmse:.4f}")
+print(f"Mean Squared Error (MSE):       {mse:.4f}")
+print(f"Mean Absolute Error (MAE):      {mae:.4f}")
+print(f"R-Squared (R2) Score:           {r2:.4f}")
+print(f"Total Execution Time (Scale + Join + Train): {elapsed_seconds:.2f} seconds ({elapsed_seconds / 60:.2f} minutes)")
+
+print("\nSample Model Predictions:")
+predictions.select("datetime", "place", "pollutant", "label", "prediction").show(5, truncate=False)
